@@ -1,27 +1,24 @@
 import http.server
 import socketserver
 import cgi
+import struct
 
-def xor(data, key):
-    k_bytes = key.encode()
-    if not k_bytes: return data
-    return bytearray([data[i] ^ k_bytes[i % len(k_bytes)] for i in range(len(data))])
+def xor_cipher_byte(b, key_str, index):
+    k_bytes = key_str.encode()
+    if not k_bytes: return b
+    return b ^ k_bytes[index % len(k_bytes)]
 
-def vigenere(data, key, encrypt=True):
-    k_bytes = key.encode()
-    if not k_bytes: return data
-    res = bytearray()
-    for i in range(len(data)):
-        k = k_bytes[i % len(k_bytes)]
-        val = (data[i] + k) % 256 if encrypt else (data[i] - k) % 256
-        res.append(val)
-    return res
+def vigenere_byte(b, key_str, index, encrypt=True):
+    k_bytes = key_str.encode()
+    if not k_bytes: return b
+    k = k_bytes[index % len(k_bytes)]
+    return (b + k) % 256 if encrypt else (b - k) % 256
 
-def caesar(val_byte, key_str, encrypt=True):
+def caesar_byte(b, key_str, encrypt=True):
     k_bytes = key_str.encode()
     shift = sum(k_bytes) % 256 if k_bytes else 0
     if not encrypt: shift = -shift
-    return (val_byte + shift) % 256
+    return (b + shift) % 256
 
 def transposition(data):
     res = bytearray(data)
@@ -29,36 +26,26 @@ def transposition(data):
         res[i], res[i+1] = res[i+1], res[i]
     return res
 
-def run_ecb(data, key, encrypt=True):
-    if encrypt:
-        temp = bytearray(data)
-        if len(temp) % 2 != 0: temp.append(0)
-        s1 = vigenere(temp, key, True)
-        s2 = transposition(s1)
-        return xor(s2, key)
-    else:
-        s1 = xor(data, key)
-        s2 = transposition(s1)
-        return vigenere(s2, key, False)
-
-def run_cbc_custom(data, k_vig, k_csr, encrypt=True, iv=0xAA):
+def run_cbc_custom(data, k_vig, k_csr, k_xor, encrypt=True, iv=0xAA):
     res = bytearray()
     prev_block = iv
-    if encrypt:
-        for b in data:
-            xored_input = b ^ prev_block
-            # Tahap Caesar pakai k_csr, Tahap Vigenere pakai k_vig
-            k1 = caesar(xored_input, k_csr, True)
-            cipher_byte = vigenere(bytes([k1]), k_vig, True)[0]
+    
+    for i, b in enumerate(data):
+        if encrypt:
+            step1 = b ^ prev_block
+            step2 = xor_cipher_byte(step1, k_xor, i)
+            step3 = caesar_byte(step2, k_csr, True)
+            cipher_byte = vigenere_byte(step3, k_vig, i, True)
             res.append(cipher_byte)
-            prev_block = cipher_byte
-    else:
-        for b in data:
-            k1 = vigenere(bytes([b]), k_vig, False)[0]
-            decrypted_block = caesar(k1, k_csr, False)
-            plain_byte = decrypted_block ^ prev_block
+            prev_block = cipher_byte 
+        else:
+            step1 = vigenere_byte(b, k_vig, i, False)
+            step2 = caesar_byte(step1, k_csr, False)
+            step3 = xor_cipher_byte(step2, k_xor, i)
+            plain_byte = step3 ^ prev_block
             res.append(plain_byte)
-            prev_block = b
+            prev_block = b 
+            
     return res
 
 HTML_TEMPLATE = """
@@ -147,7 +134,7 @@ HTML_TEMPLATE = """
 
                     <div id="f_box" style="display:none;">
                         <p>UPLOAD BITMAP:</p>
-                        <input type="file" name="f_val">
+                        <input type="file" name="f_val" accept=".bmp">
                     </div>
 
                     <p><button type="submit" class="btn-chaos">EXECUTE_NOW</button></p>
@@ -198,60 +185,102 @@ HTML_TEMPLATE = """
 </html>
 """
 
+def ecb_encrypt_bytes(d_bytes, key_vigenere, key_xor_alg):
+    s1 = bytearray()
+    for i, b in enumerate(d_bytes):
+        s1.append(vigenere_byte(b, key_vigenere, i, True))
+    s2 = transposition(s1)
+    res = bytearray()
+    for i, b in enumerate(s2):
+        res.append(xor_cipher_byte(b, key_xor_alg, i))
+    return res
+
+def ecb_decrypt_bytes(d_bytes, key_vigenere, key_xor_alg):
+    s1 = bytearray()
+    for i, b in enumerate(d_bytes):
+        s1.append(xor_cipher_byte(b, key_xor_alg, i))
+    s2 = transposition(s1)
+    res = bytearray()
+    for i, b in enumerate(s2):
+        res.append(vigenere_byte(b, key_vigenere, i, False))
+    return res
+
 class Handler(http.server.SimpleHTTPRequestHandler):
     def do_GET(self):
-        self.send_response(200); self.send_header("Content-type", "text/html"); self.end_headers()
+        self.send_response(200)
+        self.send_header("Content-type", "text/html")
+        self.end_headers()
         self.wfile.write(HTML_TEMPLATE.encode())
 
-    # --- BAGIAN DO_POST YANG DIUBAH ---
-
     def do_POST(self):
-        form = cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ={'REQUEST_METHOD':'POST', 'CONTENT_TYPE':self.headers['Content-Type']})
-        
-        # 1. Ambil Master Key dari user
+        form = cgi.FieldStorage(
+            fp=self.rfile,
+            headers=self.headers,
+            environ={'REQUEST_METHOD': 'POST', 'CONTENT_TYPE': self.headers['Content-Type']}
+        )
+
         master_key = form.getfirst("user_key", "DEFAULT").strip()
-        if not master_key: master_key = "SAFE"
+        if not master_key:
+            master_key = "SAFE"
 
-        # 2. Key Derivation (Memecah kunci agar tiap metode punya kunci unik)
-        # Anak Kunci 1: Untuk Vigenere (Gunakan kunci asli)
         key_vigenere = master_key
-        
-        # Anak Kunci 2: Untuk Caesar (Gunakan kunci yang dibalik)
-        key_caesar = master_key[::-1]
-        
-        # Anak Kunci 3: Untuk XOR (Gunakan rotasi sederhana)
-        key_xor = master_key[1:] + master_key[0] if len(master_key) > 1 else master_key
+        key_caesar   = master_key[::-1]
+        key_xor_alg  = master_key[1:] + master_key[0] if len(master_key) > 1 else master_key
 
-        op = form.getfirst("op", "enc")
-        mode = form.getfirst("mode", "ECB")
+        op      = form.getfirst("op",      "enc")
+        mode    = form.getfirst("mode",    "ECB")
         in_type = form.getfirst("in_type", "text")
 
-        # --- LOGIKA EKSEKUSI DENGAN ANAK KUNCI ---
-        # Note: Kita harus sedikit menyesuaikan fungsi run agar menerima anak kunci ini
-        # Namun agar tidak mengubah banyak kode, kita modifikasi cara panggilnya saja
-        
+        if mode == "ECB" and in_type == "file":
+            try:
+                file_item = form["f_val"]
+                bmp_data  = bytearray(file_item.file.read())
+
+                if len(bmp_data) < 54:
+                    raise ValueError("File BMP terlalu kecil / bukan BMP valid.")
+
+                pixel_offset = struct.unpack_from("<I", bmp_data, 10)[0]
+
+                header      = bmp_data[:pixel_offset]
+                pixel_data  = bmp_data[pixel_offset:]
+
+                if op == "enc":
+                    processed_pixels = ecb_encrypt_bytes(bytes(pixel_data), key_vigenere, key_xor_alg)
+                    out_filename     = "encrypted_output.bmp"
+                    action_label     = "ENKRIPSI"
+                else:
+                    processed_pixels = ecb_decrypt_bytes(bytes(pixel_data), key_vigenere, key_xor_alg)
+                    out_filename     = "decrypted_output.bmp"
+                    action_label     = "DEKRIPSI"
+
+                output_bmp = bytes(header) + bytes(processed_pixels)
+
+                self.send_response(200)
+                self.send_header("Content-Type",        "image/bmp")
+                self.send_header("Content-Disposition", f'attachment; filename="{out_filename}"')
+                self.send_header("Content-Length",      str(len(output_bmp)))
+                self.end_headers()
+                self.wfile.write(output_bmp)
+
+            except Exception as e:
+                self._send_error(str(e))
+            return
+
         val = form.getfirst("val", "").strip()
         try:
             if op == "enc":
                 d_bytes = val.encode()
                 if mode == "ECB":
-                    # Manual Pipeline ECB dengan kunci berbeda tiap tahap
-                    s1 = vigenere(d_bytes, key_vigenere, True)
-                    s2 = transposition(s1)
-                    res = xor(s2, key_xor)
+                    res = ecb_encrypt_bytes(d_bytes, key_vigenere, key_xor_alg)
                 else:
-                    # Manual Pipeline CBC dengan kunci berbeda
-                    res = run_cbc_custom(d_bytes, key_vigenere, key_caesar, True)
+                    res = run_cbc_custom(d_bytes, key_vigenere, key_caesar, key_xor_alg, True)
                 display = res.hex()
             else:
                 d_bytes = bytes.fromhex(val)
                 if mode == "ECB":
-                    # Manual Pipeline ECB Balik
-                    s1 = xor(d_bytes, key_xor)
-                    s2 = transposition(s1)
-                    res = vigenere(s2, key_vigenere, False)
+                    res = ecb_decrypt_bytes(d_bytes, key_vigenere, key_xor_alg)
                 else:
-                    res = run_cbc_custom(d_bytes, key_vigenere, key_caesar, False)
+                    res = run_cbc_custom(d_bytes, key_vigenere, key_caesar, key_xor_alg, False)
                 display = "".join(chr(b) for b in res if 31 < b < 127)
         except Exception as e:
             display = f"FATAL_ERROR: {str(e)}"
@@ -259,7 +288,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-type", "text/html")
         self.end_headers()
-        
+
         response_html = f"""
         <html>
         <body style="background:#000; color:#0f0; font-family:monospace; padding:20px;">
@@ -272,7 +301,20 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         </html>
         """
         self.wfile.write(response_html.encode())
-        
+
+    def _send_error(self, msg):
+        self.send_response(200)
+        self.send_header("Content-type", "text/html")
+        self.end_headers()
+        self.wfile.write(f"""
+        <html>
+        <body style="background:#000; color:#f00; font-family:monospace; padding:20px;">
+            <h2>FATAL_ERROR</h2><p>{msg}</p>
+            <a href="/" style="color:cyan;">[ BACK TO CONSOLE ]</a>
+        </body>
+        </html>
+        """.encode())
+
 if __name__ == "__main__":
     print("Server jalan di http://localhost:9999")
     socketserver.TCPServer(("", 9999), Handler).serve_forever()
